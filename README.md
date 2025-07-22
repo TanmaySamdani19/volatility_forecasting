@@ -120,10 +120,3 @@ volatility_forecasting/
 - Sharpe Ratio: Risk-adjusted returns
 - Maximum Drawdown: Maximum loss from peak to trough
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
