@@ -18,14 +18,16 @@ import yfinance as yf
 
 # Deep Learning
 import tensorflow as tf
-from tensorflow.keras.models import Model, Sequential
-from tensorflow.keras.layers import (LSTM, Dense, Dropout, Input, 
-                                    Conv1D, MaxPooling1D, Flatten,
-                                    Attention, MultiHeadAttention, 
-                                    LayerNormalization, Add, GRU)
+from tensorflow.keras.models import Model, Sequential, load_model
+from tensorflow.keras.layers import (
+    LSTM, Dense, Dropout, Input, BatchNormalization,
+    Conv1D, MaxPooling1D, Flatten, GlobalAveragePooling1D,
+    MultiHeadAttention, LayerNormalization, Add, GRU
+)
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TerminateOnNaN
 from tensorflow.keras.regularizers import l2
+from tensorflow.keras.losses import Huber
 
 # Statistical models for comparison
 from statsmodels.tsa.arima.model import ARIMA
@@ -215,82 +217,190 @@ class FeatureEngineering:
 
 class AttentionLSTM:
     """
-    LSTM with Attention Mechanism for volatility forecasting
+    LSTM with Attention Mechanism for volatility forecasting with improved numerical stability
     """
     
-    def __init__(self, seq_length: int, n_features: int, lstm_units: int = 50,
-                 attention_units: int = 100, dropout_rate: float = 0.2):
-        self.seq_length = seq_length
-        self.n_features = n_features
+    def __init__(self, input_shape: Tuple[int, int], lstm_units: int = 50,
+                 attention_units: int = 64, dropout_rate: float = 0.2,
+                 learning_rate: float = 0.001, clip_norm: float = 1.0):
+        self.input_shape = input_shape  # (seq_length, n_features)
         self.lstm_units = lstm_units
         self.attention_units = attention_units
         self.dropout_rate = dropout_rate
+        self.learning_rate = learning_rate
+        self.clip_norm = clip_norm
         self.model = None
-        self.attention_weights = None
+        self.history = None
+        
+    def _attention_layer(self, inputs):
+        """Self-attention layer with residual connection"""
+        # Multi-head attention
+        attention_output = MultiHeadAttention(
+            num_heads=4, 
+            key_dim=self.attention_units // 4,  # Split into 4 heads
+            dropout=self.dropout_rate
+        )(inputs, inputs)
+        
+        # Residual connection and layer norm
+        attention_output = LayerNormalization(epsilon=1e-6)(inputs + attention_output)
+        return attention_output
         
     def build_model(self) -> Model:
-        """Build LSTM with attention mechanism"""
-        # Input layer
-        inputs = Input(shape=(self.seq_length, self.n_features))
+        """Build LSTM with attention mechanism and improved stability"""
+        inputs = Input(shape=self.input_shape)
         
-        # LSTM layers
-        lstm_out = LSTM(self.lstm_units, return_sequences=True, 
-                       dropout=self.dropout_rate, 
-                       recurrent_dropout=self.dropout_rate)(inputs)
-        lstm_out = LayerNormalization()(lstm_out)
+        # First LSTM layer with return sequences
+        lstm1 = LSTM(
+            self.lstm_units, 
+            return_sequences=True, 
+            dropout=self.dropout_rate,
+            recurrent_dropout=self.dropout_rate * 0.5,  # Lower recurrent dropout
+            kernel_regularizer=l2(1e-4),
+            recurrent_regularizer=l2(1e-4)
+        )(inputs)
+        lstm1 = LayerNormalization(epsilon=1e-6)(lstm1)
         
-        lstm_out2 = LSTM(self.lstm_units, return_sequences=True, 
-                        dropout=self.dropout_rate,
-                        recurrent_dropout=self.dropout_rate)(lstm_out)
-        lstm_out2 = LayerNormalization()(lstm_out2)
+        # Second LSTM layer
+        lstm2 = LSTM(
+            self.lstm_units, 
+            return_sequences=True,
+            dropout=self.dropout_rate,
+            recurrent_dropout=self.dropout_rate * 0.5,
+            kernel_regularizer=l2(1e-4),
+            recurrent_regularizer=l2(1e-4)
+        )(lstm1)
+        lstm2 = LayerNormalization(epsilon=1e-6)(lstm2)
         
         # Attention mechanism
-        attention = MultiHeadAttention(num_heads=4, key_dim=self.attention_units)(
-            lstm_out2, lstm_out2)
-        attention = Dropout(self.dropout_rate)(attention)
-        attention = Add()([lstm_out2, attention])
-        attention = LayerNormalization()(attention)
+        attention_output = self._attention_layer(lstm2)
         
-        # Global average pooling
-        pooled = tf.keras.layers.GlobalAveragePooling1D()(attention)
+        # Global average pooling instead of flattening to reduce parameters
+        pooled = tf.keras.layers.GlobalAveragePooling1D()(attention_output)
         
-        # Dense layers
-        dense1 = Dense(64, activation='relu', kernel_regularizer=l2(0.01))(pooled)
+        # Dense layers with regularization
+        dense1 = Dense(
+            64, 
+            activation='relu',
+            kernel_regularizer=l2(1e-4),
+            kernel_initializer='he_normal'
+        )(pooled)
+        dense1 = BatchNormalization()(dense1)
         dense1 = Dropout(self.dropout_rate)(dense1)
         
-        dense2 = Dense(32, activation='relu', kernel_regularizer=l2(0.01))(dense1)
+        dense2 = Dense(
+            32, 
+            activation='relu',
+            kernel_regularizer=l2(1e-4),
+            kernel_initializer='he_normal'
+        )(dense1)
+        dense2 = BatchNormalization()(dense2)
         dense2 = Dropout(self.dropout_rate)(dense2)
         
-        # Output layer
-        outputs = Dense(1, activation='linear')(dense2)
+        # Output layer with linear activation for regression
+        outputs = Dense(1, activation='linear', kernel_initializer='glorot_normal')(dense2)
         
         self.model = Model(inputs=inputs, outputs=outputs)
         return self.model
     
-    def compile_model(self, learning_rate: float = 0.001):
-        """Compile the model"""
-        optimizer = Adam(learning_rate=learning_rate)
-        self.model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
+    def compile(self, learning_rate: float = None):
+        """Compile the model with gradient clipping and learning rate scheduling"""
+        if learning_rate is not None:
+            self.learning_rate = learning_rate
+            
+        # Learning rate schedule
+        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+            initial_learning_rate=self.learning_rate,
+            decay_steps=1000,
+            decay_rate=0.9,
+            staircase=True
+        )
+        
+        # Optimizer with gradient clipping
+        optimizer = Adam(
+            learning_rate=lr_schedule,
+            clipnorm=self.clip_norm
+        )
+        
+        # Compile with Huber loss which is more robust to outliers
+        self.model.compile(
+            optimizer=optimizer,
+            loss=tf.keras.losses.Huber(),
+            metrics=['mae', 'mse']
+        )
     
     def train(self, X_train: np.ndarray, y_train: np.ndarray,
               X_val: np.ndarray, y_val: np.ndarray,
-              epochs: int = 100, batch_size: int = 32) -> tf.keras.callbacks.History:
-        """Train the model"""
+              epochs: int = 100, batch_size: int = 32) -> dict:
+        """Train the model with improved callbacks and validation"""
+        if self.model is None:
+            self.build_model()
+            self.compile()
+        
+        # Early stopping and model checkpoint
         callbacks = [
-            EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=1e-6)
+            EarlyStopping(
+                monitor='val_loss',
+                patience=20,
+                restore_best_weights=True,
+                verbose=1
+            ),
+            ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=10,
+                min_lr=1e-6,
+                verbose=1
+            ),
+            tf.keras.callbacks.TerminateOnNaN()
         ]
         
-        history = self.model.fit(
+        # Train with validation
+        self.history = self.model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
             epochs=epochs,
             batch_size=batch_size,
             callbacks=callbacks,
-            verbose=1
+            verbose=1,
+            shuffle=True
         )
         
-        return history
+        return self.history.history
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions with input validation"""
+        if self.model is None:
+            raise ValueError("Model not trained. Call train() first.")
+            
+        # Ensure input has the right shape
+        if len(X.shape) == 2:
+            X = np.expand_dims(X, axis=0)
+            
+        # Make predictions
+        predictions = self.model.predict(X, verbose=0)
+        
+        # Handle potential NaN/Inf values
+        if np.any(np.isnan(predictions)) or np.any(np.isinf(predictions)):
+            logger.warning("NaN or Inf values detected in predictions. Applying corrections.")
+            predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+            
+        return predictions.squeeze()
+    
+    def save(self, filepath: str):
+        """Save the model to disk"""
+        if self.model is None:
+            raise ValueError("No model to save. Train the model first.")
+        self.model.save(filepath)
+        logger.info(f"Model saved to {filepath}")
+    
+    @classmethod
+    def load(cls, filepath: str):
+        """Load a saved model"""
+        model = tf.keras.models.load_model(filepath)
+        # Create a new instance and attach the loaded model
+        instance = cls(input_shape=model.input_shape[1:])
+        instance.model = model
+        return instance
 
 class CNN_GRU_Attention:
     """

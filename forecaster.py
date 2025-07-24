@@ -442,39 +442,149 @@ class VolatilityForecaster:
     
     def save_models(self, output_dir: str = 'saved_models'):
         """
-        Save trained models to disk.
         
-        Args:
-            output_dir: Directory to save models
-        """
-        import joblib  # Import joblib here to avoid dependency if not using benchmark models
+    Args:
+        X_test: Test features
+        y_test: Test targets
+            
+    Returns:
+        Dictionary of evaluation metrics for each model
+    """
+    results = {}
         
-        os.makedirs(output_dir, exist_ok=True)
+    # Ensure output directory exists
+    os.makedirs(self.config['evaluation']['output_dir'], exist_ok=True)
         
-        for model_name, model in self.models.items():
-            try:
-                if model_name in ['ARIMA', 'GARCH']:
-                    # Save benchmark models using joblib
-                    model_path = os.path.join(output_dir, f'{model_name.lower()}.pkl')
-                    joblib.dump(model, model_path)
-                else:
-                    # Save Keras models using the modern .keras format
-                    model_path = os.path.join(output_dir, f'{model_name.lower()}.keras')
-                    model.save(model_path)
+    # Evaluate deep learning models
+    for model_name, model in self.models.items():
+        if model_name == 'Benchmark':
+            continue
                 
-                logger.info(f"Saved {model_name} model to {model_path}")
+        logger.info(f"Evaluating {model_name}...")
+            
+        # Make predictions
+        y_pred_scaled = model.predict(X_test)
+            
+        # Inverse transform predictions
+        y_pred = self.feature_engineer.inverse_transform_target(y_pred_scaled)
+        y_true = self.feature_engineer.inverse_transform_target(y_test)
+            
+        # Calculate metrics
+        metrics = self.evaluator.calculate_metrics(y_true, y_pred, model_name)
+        results[model_name] = metrics
+            
+        # Plot predictions
+        if self.config['evaluation']['save_plots']:
+            plot_path = os.path.join(
+                self.config['evaluation']['output_dir'],
+                f"{model_name.lower()}_predictions.png"
+            )
+            self.evaluator.plot_predictions(
+                y_true, y_pred, 
+                model_name=model_name,
+                save_path=plot_path
+            )
+        
+    # Evaluate benchmark models
+    if 'Benchmark' in self.models:
+        benchmark = self.models['Benchmark']
+            
+        # ARIMA evaluation
+        if hasattr(benchmark, 'models') and 'ARIMA' in benchmark.models:
+            logger.info("Evaluating ARIMA...")
+                
+            # ARIMA needs to be evaluated differently as it's univariate
+            # This is a simplified evaluation
+            try:
+                y_pred_arima = benchmark.predict_arima(steps=len(y_test))
+                y_true_arima = self.data_loader.processed_data[self.config['data']['target_col']].values[-len(y_test):]
+                    
+                metrics = self.evaluator.calculate_metrics(
+                    y_true_arima, y_pred_arima, 'ARIMA'
+                )
+                results['ARIMA'] = metrics
             except Exception as e:
-                logger.error(f"Error saving {model_name}: {str(e)}")
+                logger.error(f"Error evaluating ARIMA: {e}")
+            
+        # GARCH evaluation
+        if hasattr(benchmark, 'models') and 'GARCH' in benchmark.models:
+            logger.info("Evaluating GARCH...")
+                
+            try:
+                # GARCH predicts volatility, not prices
+                # For comparison, we'll use the last price * (1 + predicted_vol)
+                last_price = self.data_loader.processed_data[self.config['data']['target_col']].iloc[-len(y_test)-1]
+                y_pred_garch = benchmark.predict_garch(steps=len(y_test))
+                y_pred_prices = last_price * (1 + y_pred_garch)
+                    
+                y_true_garch = self.data_loader.processed_data[self.config['data']['target_col']].values[-len(y_test):]
+                    
+                metrics = self.evaluator.calculate_metrics(
+                    y_true_garch, y_pred_prices, 'GARCH'
+                )
+                results['GARCH'] = metrics
+            except Exception as e:
+                logger.error(f"Error evaluating GARCH: {e}")
         
-        # Save feature engineering objects
-        fe_path = os.path.join(output_dir, 'feature_engineering.joblib')
-        joblib.dump(self.feature_engineer, fe_path)
-        logger.info(f"Saved feature engineering objects to {fe_path}")
+    # Save results
+    self.results = results
+    results_path = os.path.join(
+        self.config['evaluation']['output_dir'],
+        'evaluation_results.csv'
+    )
         
-        # Save config
-        config_path = os.path.join(output_dir, 'config.json')
-        with open(config_path, 'w') as f:
-            json.dump(self.config, f, indent=2)
+    results_df = pd.DataFrame(results).T
+    results_df.to_csv(results_path)
+    logger.info(f"Results saved to {results_path}")
+        
+    return results
+    
+def save_models(self, output_dir: str = 'saved_models'):
+    """
+    Save trained models to disk.
+        
+    Args:
+        output_dir: Directory to save models
+    """
+    import joblib
+        
+    os.makedirs(output_dir, exist_ok=True)
+        
+    for model_name, model in self.models.items():
+        try:
+            if model_name == 'Benchmark':
+                # Handle benchmark models (ARIMA, GARCH)
+                benchmark_path = os.path.join(output_dir, 'benchmark_models')
+                os.makedirs(benchmark_path, exist_ok=True)
+                    
+                # Save each benchmark model separately
+                if hasattr(model, 'models'):
+                    for bm_name, bm_model in model.models.items():
+                        bm_path = os.path.join(benchmark_path, f'{bm_name.lower()}.joblib')
+                        joblib.dump(bm_model, bm_path)
+                        logger.info(f"Saved {bm_name} model to {bm_path}")
+            else:
+                # Save deep learning models
+                model_path = os.path.join(output_dir, f'{model_name.lower()}.keras')
+                if hasattr(model, 'model'):  # For Keras models
+                    model.model.save(model_path)
+                else:  # For custom models with save method
+                    model.save(model_path)
+                logger.info(f"Saved {model_name} model to {model_path}")
+                        
+        except Exception as e:
+            logger.error(f"Error saving {model_name}: {str(e)}")
+        
+    # Save feature engineering objects
+    fe_path = os.path.join(output_dir, 'feature_engineering.joblib')
+    joblib.dump(self.feature_engineer, fe_path) 
+    logger.info(f"Saved feature engineering objects to {fe_path}")
+        
+    # Save config
+    config_path = os.path.join(output_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(self.config, f, indent=2)
+    logger.info(f"Saved config to {config_path}")
         logger.info(f"Saved config to {config_path}")
     
     @classmethod

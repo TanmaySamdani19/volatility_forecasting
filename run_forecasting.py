@@ -20,9 +20,9 @@ def main():
     config = {
         'data': {
             'symbol': '^VIX',  # CBOE Volatility Index
-            'start_date': '2010-01-01',  # 5 years of training data
+            'start_date': '2010-01-01', 
             'end_date': '2023-12-31',
-            'test_size': 0.3,  # 20% test set
+            'test_size': 0.3,  
             'target_col': 'Close',
             'sequence_length': 20  # Number of time steps to use for prediction
         },

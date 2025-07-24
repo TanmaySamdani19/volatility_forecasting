@@ -10,8 +10,9 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, LSTM, Dense, Dropout, Conv1D, MaxPooling1D,
     MultiHeadAttention, LayerNormalization, Add, GRU, GlobalAveragePooling1D,
-    BatchNormalization
+    BatchNormalization, Embedding, Flatten, Reshape, Multiply
 )
+from tensorflow.keras import backend as K
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
@@ -248,133 +249,307 @@ class BaseModel:
 
 class AttentionLSTM(BaseModel):
     """
-    LSTM with Attention Mechanism for volatility forecasting.
+    Enhanced LSTM with Attention Mechanism for volatility forecasting.
+    Includes improvements for numerical stability and training reliability.
     """
     
     def __init__(self, input_shape: Tuple[int, int], 
-                 lstm_units: int = 256,  # Increased capacity
-                 attention_units: int = 128,
-                 dropout_rate: float = 0.3,  # Slightly higher dropout
-                 l2_reg: float = 0.001,  # Reduced L2 regularization
-                 learning_rate: Union[float, Dict[str, Any]] = 0.001,
-                 use_batch_norm: bool = True):
+                 lstm_units: int = 128,
+                 attention_units: int = 64,
+                 dropout_rate: float = 0.2,
+                 l2_reg: float = 1e-4,
+                 learning_rate: Union[float, Dict[str, Any]] = 1e-3,
+                 clip_norm: float = 1.0,
+                 use_batch_norm: bool = True,
+                 activation: str = 'tanh',
+                 recurrent_activation: str = 'sigmoid'):
         """
         Initialize the enhanced AttentionLSTM model.
         
         Args:
             input_shape: Tuple of (sequence_length, n_features)
-            lstm_units: Number of LSTM units in the first layer
+            lstm_units: Number of LSTM units in layers
             attention_units: Dimensionality of the attention layer
-            dropout_rate: Dropout rate
+            dropout_rate: Dropout rate (0-1)
             l2_reg: L2 regularization factor
-            learning_rate: Learning rate for the optimizer (float or dict with schedule config)
+            learning_rate: Learning rate (float or dict with schedule config)
+            clip_norm: Maximum gradient norm for clipping
             use_batch_norm: Whether to use batch normalization
+            activation: Activation function for LSTM cells
+            recurrent_activation: Recurrent activation function for LSTM cells
         """
         super().__init__(input_shape)
         self.lstm_units = lstm_units
         self.attention_units = attention_units
         self.dropout_rate = dropout_rate
         self.l2_reg = l2_reg
-        self.learning_rate = learning_rate  # Store the learning rate config
+        self.learning_rate = learning_rate
+        self.clip_norm = clip_norm
         self.use_batch_norm = use_batch_norm
+        self.activation = activation
+        self.recurrent_activation = recurrent_activation
+        self._validate_initialization()
     
-    def build_model(self) -> Model:
-        """Build the enhanced LSTM with attention architecture."""
-        inputs = Input(shape=self.input_shape)
-        x = inputs
+    def _validate_initialization(self):
+        """Validate initialization parameters."""
+        if self.dropout_rate < 0 or self.dropout_rate >= 1:
+            raise ValueError(f"dropout_rate must be in [0, 1), got {self.dropout_rate}")
+        if self.l2_reg < 0:
+            raise ValueError(f"l2_reg must be >= 0, got {self.l2_reg}")
+        if self.clip_norm <= 0:
+            raise ValueError(f"clip_norm must be > 0, got {self.clip_norm}")
+    
+    def _validate_input(self, X: np.ndarray) -> np.ndarray:
+        """Validate and clean input data."""
+        if not isinstance(X, np.ndarray):
+            X = np.array(X, dtype=np.float32)
         
-        # Initial batch normalization
-        if self.use_batch_norm:
-            x = BatchNormalization()(x)
+        # Check for NaN/Inf values
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+            logger.warning("Input contains NaN or Inf values. Replacing with nearest valid values.")
+            X = np.nan_to_num(X, nan=0.0, posinf=np.finfo(np.float32).max, 
+                            neginf=np.finfo(np.float32).min)
         
-        # First LSTM layer with skip connection
-        lstm1 = LSTM(
-            units=self.lstm_units,
-            return_sequences=True,
-            kernel_regularizer=l2(self.l2_reg),
-            recurrent_regularizer=l2(self.l2_reg),
-            recurrent_dropout=self.dropout_rate * 0.5
-        )(x)
-        lstm1 = LayerNormalization()(lstm1)
-        lstm1 = Dropout(self.dropout_rate)(lstm1)
-        
-        # Second LSTM layer with skip connection
-        lstm2 = LSTM(
-            units=self.lstm_units // 2,
-            return_sequences=True,
-            kernel_regularizer=l2(self.l2_reg),
-            recurrent_regularizer=l2(self.l2_reg),
-            recurrent_dropout=self.dropout_rate * 0.5
-        )(lstm1)
-        lstm2 = LayerNormalization()(lstm2)
-        
-        # Project to attention dimension
-        attention_input = Dense(self.attention_units)(lstm2)
-        
-        # Multi-head attention with residual connection
+        # Ensure correct shape
+        if len(X.shape) == 2:
+            X = np.expand_dims(X, axis=0)
+        elif len(X.shape) != 3:
+            raise ValueError(f"Input must be 2D or 3D array, got shape {X.shape}")
+            
+        return X
+    
+    def _attention_layer(self, inputs):
+        """Self-attention layer with residual connection and layer norm."""
+        # Multi-head attention with scaled dot-product attention
         attention_output = MultiHeadAttention(
-            num_heads=8,
-            key_dim=self.attention_units // 8,
-            value_dim=self.attention_units // 8,
-            dropout=self.dropout_rate * 0.5
-        )(attention_input, attention_input)
+            num_heads=4,
+            key_dim=max(1, self.attention_units // 4),  # Ensure at least 1
+            dropout=self.dropout_rate * 0.5,
+            kernel_regularizer=l2(self.l2_reg),
+            bias_regularizer=l2(self.l2_reg)
+        )(inputs, inputs)
         
-        # Add & Norm with residual connection
-        attention = LayerNormalization(epsilon=1e-6)(attention_input + attention_output)
-        attention = Dropout(self.dropout_rate)(attention)
-        
-        # Project back to LSTM dimension if needed
-        if attention.shape[-1] != lstm2.shape[-1]:
-            attention = Dense(lstm2.shape[-1])(attention)
-        
-        # Final residual connection from LSTM2
-        attention = Add()([lstm2, attention])
-        attention = LayerNormalization(epsilon=1e-6)(attention)
-        
-        # Global average pooling
-        pooled = GlobalAveragePooling1D()(attention)
-        
-        # Enhanced dense layers with skip connections
-        dense1 = self._dense_block(pooled, 256, dropout_rate=self.dropout_rate)
-        dense2 = self._dense_block(dense1, 128, dropout_rate=self.dropout_rate)
-        dense3 = self._dense_block(dense2, 64, dropout_rate=self.dropout_rate)
-        
-        # Output layer
-        outputs = Dense(1, activation='linear')(dense3)
-        
-        model = Model(inputs=inputs, outputs=outputs)
-        return model
-        
-    def _dense_block(self, x, units, dropout_rate=0.2):
+        # Add & Norm
+        attention_output = LayerNormalization(epsilon=1e-6)(inputs + attention_output)
+        return attention_output
+    
+    def _dense_block(self, x, units, activation='relu', dropout_rate=0.2):
         """Helper function to create a dense block with batch norm and dropout."""
-        # Skip connection if dimensions match
-        if x.shape[-1] == units:
-            x_shortcut = x
-        else:
-            x_shortcut = Dense(units)(x)
+        # Weight initialization
+        initializer = tf.keras.initializers.HeNormal()
         
-        # Dense layer with activation
-        x = Dense(units, activation='relu', 
-                 kernel_regularizer=l2(self.l2_reg))(x)
+        # Dense layer with kernel initialization and regularization
+        x = Dense(
+            units,
+            activation=activation,
+            kernel_initializer=initializer,
+            kernel_regularizer=l2(self.l2_reg),
+            bias_regularizer=l2(self.l2_reg)
+        )(x)
         
         # Batch normalization if enabled
         if self.use_batch_norm:
-            x = BatchNormalization()(x)
+            x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+        
+        # Dropout with rate scaling
+        if dropout_rate > 0:
+            x = Dropout(min(dropout_rate, 0.5))(x)  # Cap dropout at 0.5
             
-        x = Dropout(dropout_rate)(x)
-        
-        # Add skip connection
-        x = Add()([x, x_shortcut])
-        
         return x
+    
+    def _create_lstm_layer(self, units, return_sequences=False, return_state=False):
+        """Create an LSTM layer with consistent configuration."""
+        return LSTM(
+            units=units,
+            activation=self.activation,
+            recurrent_activation=self.recurrent_activation,
+            return_sequences=return_sequences,
+            return_state=return_state,
+            kernel_initializer='glorot_uniform',
+            recurrent_initializer='orthogonal',
+            bias_initializer='zeros',
+            kernel_regularizer=l2(self.l2_reg),
+            recurrent_regularizer=l2(self.l2_reg),
+            bias_regularizer=l2(self.l2_reg),
+            dropout=self.dropout_rate * 0.5,
+            recurrent_dropout=self.dropout_rate * 0.3
+        )
+    
+    def build_model(self) -> Model:
+        """Build the enhanced LSTM with attention architecture."""
+        # Input layer
+        inputs = Input(shape=self.input_shape, name='input_layer')
+        x = inputs
+        
+        # Input normalization
+        if self.use_batch_norm:
+            x = BatchNormalization(name='input_bn')(x)
+        
+        # First LSTM layer
+        lstm1 = self._create_lstm_layer(
+            units=self.lstm_units,
+            return_sequences=True
+        )(x)
+        lstm1 = LayerNormalization(epsilon=1e-6, name='lstm1_ln')(lstm1)
+        lstm1 = Dropout(self.dropout_rate)(lstm1)
+        
+        # Second LSTM layer with residual connection
+        lstm2 = self._create_lstm_layer(
+            units=self.lstm_units // 2,
+            return_sequences=True
+        )(lstm1)
+        lstm2 = LayerNormalization(epsilon=1e-6, name='lstm2_ln')(lstm2)
+        
+        # Attention mechanism with residual connection
+        attention_output = self._attention_layer(lstm2)
+        attention_output = Dropout(self.dropout_rate)(attention_output)
+        
+        # Residual connection from LSTM2 to attention output
+        if lstm2.shape[-1] == attention_output.shape[-1]:
+            attention_output = Add()([lstm2, attention_output])
+            attention_output = LayerNormalization(epsilon=1e-6, name='attention_res_ln')(attention_output)
+        
+        # Global average pooling
+        pooled = GlobalAveragePooling1D(name='global_avg_pool')(attention_output)
+        
+        # Dense layers with skip connections
+        dense1 = self._dense_block(pooled, 64, dropout_rate=self.dropout_rate)
+        dense2 = self._dense_block(dense1, 32, dropout_rate=self.dropout_rate)
+        
+        # Output layer with linear activation
+        outputs = Dense(
+            1,
+            activation='linear',
+            kernel_initializer='glorot_normal',
+            kernel_regularizer=l2(self.l2_reg),
+            name='output_layer'
+        )(dense2)
+        
+        # Create and compile model
+        model = Model(inputs=inputs, outputs=outputs, name='AttentionLSTM')
+        return model
+    
+    def compile(self, learning_rate: Optional[Union[float, Dict[str, Any]]] = None) -> None:
+        """
+        Compile the model with improved settings and stability.
+        
+        Args:
+            learning_rate: Optional learning rate to override the one set in __init__
+                Can be a float or a dict with schedule configuration.
+        """
+        if self.model is None:
+            self.model = self.build_model()
+        
+        # Use provided learning rate or the one from init
+        lr = learning_rate if learning_rate is not None else self.learning_rate
+        
+        # Handle learning rate schedule if provided as dict
+        if isinstance(lr, dict):
+            lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+                initial_learning_rate=lr.get('initial_learning_rate', 1e-3),
+                decay_steps=lr.get('decay_steps', 1000),
+                decay_rate=lr.get('decay_rate', 0.9),
+                staircase=lr.get('staircase', True)
+            )
+            lr = lr_schedule
+        
+        # Optimizer with gradient clipping and weight decay
+        optimizer = Adam(
+            learning_rate=lr,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-7,  # Larger epsilon for numerical stability
+            clipnorm=self.clip_norm,
+            clipvalue=0.5  # Additional gradient clipping
+        )
+        
+        # Huber loss is more robust to outliers than MSE
+        loss = tf.keras.losses.Huber(
+            delta=1.0,  # Controls the point where the loss changes from L2 to L1
+            reduction='auto',
+            name='huber_loss'
+        )
+        
+        # Compile model with metrics
+        self.model.compile(
+            optimizer=optimizer,
+            loss=loss,
+            metrics=[
+                'mae',
+                'mse',
+                tf.keras.metrics.RootMeanSquaredError(name='rmse'),
+                tf.keras.metrics.MeanAbsolutePercentageError(name='mape')
+            ]
+        )
+        
+        logger.info("Model compiled successfully with learning rate: %s", 
+                   lr.initial_learning_rate if hasattr(lr, 'initial_learning_rate') else lr)
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Make predictions with input validation and error handling.
+        
+        Args:
+            X: Input data of shape (n_samples, seq_len, n_features) or (seq_len, n_features)
+            
+        Returns:
+            Array of predictions with shape (n_samples,) or (n_samples, 1)
+            
+        Raises:
+            ValueError: If model is not trained or input is invalid
+            RuntimeError: If prediction fails
+        """
+        try:
+            if self.model is None:
+                raise ValueError("Model not trained. Call fit() first.")
+                
+            if not isinstance(X, np.ndarray):
+                X = np.array(X, dtype=np.float32)
+            
+            # Store original shape for later
+            original_shape = X.shape
+            
+            # Ensure input has the right shape
+            if len(X.shape) == 2:
+                X = np.expand_dims(X, axis=0)
+            elif len(X.shape) != 3:
+                raise ValueError(f"Input must be 2D or 3D array, got shape {original_shape}")
+            
+            # Validate input dimensions match model expectations
+            if X.shape[1:] != self.input_shape:
+                raise ValueError(
+                    f"Input shape {X.shape[1:]} does not match model's expected input shape {self.input_shape}"
+                )
+            
+            # Clean input data
+            X = np.nan_to_num(X, nan=0.0, posinf=np.finfo(np.float32).max, 
+                             neginf=np.finfo(np.float32).min)
+            
+            # Make predictions
+            predictions = self.model.predict(X, verbose=0)
+            
+            # Handle potential NaN/Inf values in predictions
+            if np.any(np.isnan(predictions)) or np.any(np.isinf(predictions)):
+                logger.warning("NaN or Inf values detected in predictions. Applying corrections.")
+                predictions = np.nan_to_num(
+                    predictions, 
+                    nan=0.0, 
+                    posinf=np.finfo(np.float32).max,
+                    neginf=np.finfo(np.float32).min
+                )
+            
+            # Return with appropriate shape
+            return predictions.squeeze()
+            
+        except Exception as e:
+            logger.error(f"Prediction failed: {str(e)}")
+            raise RuntimeError(f"Failed to make predictions: {str(e)}") from e
 
 
 class CNN_GRU_Attention(BaseModel):
-    """
-    CNN-GRU with Attention for volatility forecasting.
+    """CNN-GRU with Attention for volatility forecasting.
     Combines CNN for local pattern extraction with GRU for sequence modeling
-    and attention for focusing on important time steps.
-    """
+    and attention for focusing on important time steps."""
     
     def __init__(self, input_shape: Tuple[int, int],
                  conv_filters: int = 64,
