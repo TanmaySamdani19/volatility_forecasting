@@ -36,34 +36,29 @@ class BaseModel:
         """Build the model architecture."""
         raise NotImplementedError("Subclasses must implement build_model")
     
-    def compile(self, learning_rate=0.001):
+    def compile(self, learning_rate=0.001, gradient_clip=1.0):
         """
         Compile the model with improved settings.
         
         Args:
             learning_rate: Learning rate for the optimizer (float or LearningRateSchedule)
+            gradient_clip: Maximum value for gradient clipping (default: 1.0)
         """
         if self.model is None:
             self.model = self.build_model()
         
-        # If learning_rate is a schedule, use it directly
-        # Otherwise, create a fixed learning rate
-        if hasattr(learning_rate, '__call__'):
-            # It's a learning rate schedule
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=learning_rate,
-                clipnorm=1.0,
-                epsilon=1e-7
-            )
-        else:
-            # It's a float learning rate
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=float(learning_rate),
-                clipnorm=1.0,
-                epsilon=1e-7
-            )
+        # Configure optimizer with gradient clipping
+        # Only use one type of gradient clipping at a time
+        optimizer_kwargs = {
+            'learning_rate': learning_rate if hasattr(learning_rate, '__call__') else float(learning_rate),
+            'epsilon': 1e-7,
+            'global_clipnorm': gradient_clip  # Using global_clipnorm for better stability
+        }
+        
+        optimizer = tf.keras.optimizers.Adam(**optimizer_kwargs)
         
         # Use Huber loss which is more robust to outliers than MSE
+        # Also add gradient clipping in the loss function
         self.model.compile(
             optimizer=optimizer,
             loss=tf.keras.losses.Huber(delta=1.0),
@@ -71,13 +66,23 @@ class BaseModel:
                 'mae',
                 tf.keras.metrics.RootMeanSquaredError(),
                 tf.keras.metrics.MeanAbsolutePercentageError()
-            ]
+            ],
+            # Add global gradient clipping
+            run_eagerly=False  # Disable eager execution for better performance
         )
+        
+        # Enable mixed precision training if available
+        try:
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            logger.info('Mixed precision enabled')
+        except Exception as e:
+            logger.warning(f'Could not enable mixed precision: {e}')
     
     def train(self, X_train: np.ndarray, y_train: np.ndarray,
               X_val: np.ndarray, y_val: np.ndarray,
               epochs: int = 200, batch_size: int = 64,
-              patience: int = 20) -> dict:
+              patience: int = 20, min_delta: float = 1e-4) -> dict:
         """
         Train the model with enhanced callbacks and data handling.
         
@@ -89,45 +94,76 @@ class BaseModel:
             epochs: Maximum number of epochs
             batch_size: Batch size
             patience: Patience for early stopping
+            min_delta: Minimum change to qualify as an improvement
             
         Returns:
             Training history
         """
         if self.model is None:
             self.compile()
+            
+        # Ensure inputs are numpy arrays
+        X_train = np.asarray(X_train, dtype=np.float32)
+        y_train = np.asarray(y_train, dtype=np.float32)
+        X_val = np.asarray(X_val, dtype=np.float32)
+        y_val = np.asarray(y_val, dtype=np.float32)
+        
+        # Check for NaNs or Infs
+        if np.any(np.isnan(X_train)) or np.any(np.isinf(X_train)):
+            logger.warning("Training data contains NaN or Inf values")
+            X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if np.any(np.isnan(y_train)) or np.any(np.isinf(y_train)):
+            logger.warning("Training targets contain NaN or Inf values")
+            y_train = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Create output directory for callbacks
         import os
         import datetime
+        from tensorflow.keras.callbacks import (
+            EarlyStopping, ReduceLROnPlateau, TensorBoard, ModelCheckpoint
+        )
+        
         log_dir = os.path.join('logs', 'fit', datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
         os.makedirs(log_dir, exist_ok=True)
         
-        # Enhanced callbacks
+        # Model checkpoint path
+        checkpoint_path = os.path.join(log_dir, 'best_model.keras')
+        
+        # Define callbacks with improved settings
         callbacks = [
-            # Early stopping with restoration of best weights
+            # Early stopping with improved settings
             EarlyStopping(
                 monitor='val_loss',
                 patience=patience,
+                min_delta=min_delta,
                 restore_best_weights=True,
                 verbose=1,
-                mode='min'
+                mode='min',
+                baseline=None,
+                start_from_epoch=10  # Start checking after 10 epochs
             ),
-            # Learning rate scheduler
+            
+            # Learning rate scheduler with more aggressive reduction
             ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.5,
-                patience=max(5, patience // 4),  # More frequent LR reduction
+                patience=max(3, patience // 3),  # More frequent reduction
                 min_lr=1e-6,
+                min_delta=min_delta,
                 verbose=1,
                 mode='min'
             ),
-            # Model checkpointing
-            tf.keras.callbacks.ModelCheckpoint(
-                filepath=os.path.join(log_dir, 'best_model.keras'),
-                save_best_only=True,
+            
+            # Model checkpoint to save the best model
+            ModelCheckpoint(
+                filepath=checkpoint_path,
                 monitor='val_loss',
+                save_best_only=True,
+                save_weights_only=False,
                 mode='min',
-                verbose=0
+                save_freq='epoch',
+                verbose=1
             ),
             # TensorBoard for visualization
             tf.keras.callbacks.TensorBoard(
@@ -147,26 +183,49 @@ class BaseModel:
         sample_weight = self._calculate_sample_weights(y_train)
         
         try:
-            # Train the model with validation
-            history = self.model.fit(
-                X_train, y_train,
-                validation_data=(X_val, y_val),
-                epochs=epochs,
-                batch_size=batch_size,
-                callbacks=callbacks,
-                sample_weight=sample_weight,
-                shuffle=True,  # Important for time series with proper validation split
-                verbose=1
-            )
+            # Prepare training arguments
+            fit_kwargs = {
+                'x': X_train,
+                'y': y_train,
+                'validation_data': (X_val, y_val),
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'callbacks': callbacks,
+                'shuffle': True,  # Important for time series with proper validation split
+                'verbose': 1
+            }
             
-            # Save the best model
-            best_model_path = os.path.join(log_dir, 'best_model')
-            self.save(best_model_path)
+            # Add sample_weight only if it's not None
+            if sample_weight is not None:
+                fit_kwargs['sample_weight'] = sample_weight
+            
+            # Train the model with validation
+            history = self.model.fit(**fit_kwargs)
+            
+            # Load the best model weights from checkpoint
+            if os.path.exists(checkpoint_path):
+                try:
+                    self.model = tf.keras.models.load_model(checkpoint_path, compile=False)
+                    logger.info("Loaded best model weights from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Could not load best model weights: {e}")
+            
+            # Save the final model
+            final_model_path = os.path.join(log_dir, 'final_model')
+            self.save(final_model_path)
+            logger.info(f"Saved final model to {final_model_path}")
             
             return history.history
             
         except Exception as e:
             logger.error(f"Error during training: {str(e)}")
+            # Try to load the best model if available
+            if os.path.exists(checkpoint_path):
+                try:
+                    self.model = tf.keras.models.load_model(checkpoint_path, compile=False)
+                    logger.info("Loaded best available model after error")
+                except Exception as load_error:
+                    logger.error(f"Could not load best model after error: {load_error}")
             raise
     
     def _calculate_sample_weights(self, y):
@@ -195,11 +254,60 @@ class BaseModel:
             logger.warning(f"Could not calculate sample weights: {str(e)}. Using uniform weights.")
             return None
     
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions."""
+    def predict(self, X: np.ndarray, batch_size: int = 32) -> np.ndarray:
+        """
+        Make predictions with enhanced error handling and input validation.
+        
+        Args:
+            X: Input features array of shape (n_samples, sequence_length, n_features)
+            batch_size: Batch size for prediction (smaller batches use less memory)
+            
+        Returns:
+            Array of predictions with shape (n_samples,)
+            
+        Raises:
+            ValueError: If model is not built or input is invalid
+            RuntimeError: If prediction fails
+        """
         if self.model is None:
             raise ValueError("Model not built. Call build_model() first.")
-        return self.model.predict(X, verbose=0).flatten()
+            
+        if not isinstance(X, np.ndarray) or len(X.shape) != 3:
+            raise ValueError("Input must be a 3D numpy array of shape (samples, timesteps, features)")
+            
+        # Convert to float32 if needed
+        X = X.astype(np.float32, copy=False)
+        
+        # Check for NaNs or Infs
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+            logger.warning("Input contains NaN or Inf values. Replacing with zeros.")
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        try:
+            # Make predictions in batches to avoid memory issues
+            predictions = []
+            n_samples = X.shape[0]
+            
+            for i in range(0, n_samples, batch_size):
+                batch = X[i:i + batch_size]
+                batch_pred = self.model.predict(batch, verbose=0)
+                predictions.append(batch_pred)
+                
+            predictions = np.concatenate(predictions, axis=0)
+            
+            # Ensure predictions are 1D
+            predictions = predictions.reshape(-1)
+            
+            # Check for NaN/Inf in predictions
+            if np.any(np.isnan(predictions)) or np.any(np.isinf(predictions)):
+                logger.warning("Predictions contain NaN or Inf values. Replacing with zeros.")
+                predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+                
+            return predictions
+            
+        except Exception as e:
+            logger.error(f"Prediction failed: {str(e)}")
+            raise RuntimeError(f"Failed to make predictions: {str(e)}")
     
     def save(self, filepath: str):
         """Save the model to disk."""

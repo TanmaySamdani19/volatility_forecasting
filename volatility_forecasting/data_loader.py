@@ -280,21 +280,49 @@ class DataLoader:
             
             if PANDAS_TA_AVAILABLE:
                 # Use pandas_ta for technical indicators
+                # Calculate indicators using pandas_ta
                 df['RSI'] = ta.rsi(df['Close'], length=14)
-                df['MACD'], df['MACD_signal'], _ = ta.macd(df['Close'])
-                df['BB_upper'], df['BB_middle'], df['BB_lower'] = ta.bbands(df['Close'])
-                df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'])
                 
-                # Rename columns to match our naming convention
-                column_mapping = {
-                    'RSI_14': 'RSI',
-                    'MACD_12_26_9': 'MACD',
-                    'MACD_12_26_9_SIGNAL': 'MACD_signal',
-                    'BBU_20_2.0': 'BB_upper',
-                    'BBM_20_2.0': 'BB_middle',
-                    'BBL_20_2.0': 'BB_lower',
-                    'ATRr_14': 'ATR'
-                }
+                # MACD calculation
+                macd_result = ta.macd(df['Close'])
+                if isinstance(macd_result, pd.DataFrame):
+                    df['MACD'] = macd_result['MACD_12_26_9']
+                    df['MACD_signal'] = macd_result['MACDs_12_26_9']
+                else:
+                    df['MACD'], df['MACD_signal'], _ = macd_result
+                
+                # Bollinger Bands calculation with fallback to manual calculation
+                try:
+                    bbands_result = ta.bbands(df['Close'])
+                    if bbands_result is not None and not bbands_result.empty:
+                        # Handle different possible column names
+                        upper_col = next((col for col in ['BBU_20_2.0', 'BBU_20_2', 'BBU', 'upper'] 
+                                        if col in bbands_result.columns), None)
+                        middle_col = next((col for col in ['BBM_20_2.0', 'BBM_20_2', 'BBM', 'middle'] 
+                                         if col in bbands_result.columns), None)
+                        lower_col = next((col for col in ['BBL_20_2.0', 'BBL_20_2', 'BBL', 'lower'] 
+                                        if col in bbands_result.columns), None)
+                        
+                        if all(col is not None for col in [upper_col, middle_col, lower_col]):
+                            df['BB_upper'] = bbands_result[upper_col].values
+                            df['BB_middle'] = bbands_result[middle_col].values
+                            df['BB_lower'] = bbands_result[lower_col].values
+                        else:
+                            raise ValueError("Could not find required Bollinger Bands columns")
+                    else:
+                        raise ValueError("Empty result from bbands")
+                except Exception as e:
+                    logger.warning(f"Using manual Bollinger Bands calculation due to: {e}")
+                    # Fallback to manual calculation
+                    window = 20
+                    df['BB_middle'] = df['Close'].rolling(window=window).mean()
+                    df['BB_std'] = df['Close'].rolling(window=window).std()
+                    df['BB_upper'] = df['BB_middle'] + (df['BB_std'] * 2)
+                    df['BB_lower'] = df['BB_middle'] - (df['BB_std'] * 2)
+                    df = df.drop(columns=['BB_std'])
+                
+                # ATR calculation
+                df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'])
                 
                 # Only rename columns that exist in the DataFrame
                 rename_dict = {k: v for k, v in column_mapping.items() if k in df.columns}
@@ -310,10 +338,8 @@ class DataLoader:
             indicator_columns = ['RSI', 'MACD', 'MACD_signal', 'BB_upper', 'BB_middle', 'BB_lower', 'ATR']
             for col in indicator_columns:
                 if col in df.columns:
-                    # Forward fill first
-                    df[col] = df[col].fillna(method='ffill')
-                    # Then backward fill
-                    df[col] = df[col].fillna(method='bfill')
+                    # Forward fill and backward fill remaining NaNs
+                    df[col] = df[col].ffill().bfill()
                     # Finally fill remaining NaNs with column mean
                     df[col] = df[col].fillna(df[col].mean())
             
@@ -495,12 +521,22 @@ class DataLoader:
             sequence = X[i:(i + sequence_length)]
             target = y[i + sequence_length - 1]
             
-            # Handle NaNs in sequence by filling with mean
-            if np.isnan(sequence).any():
-                sequence = np.nan_to_num(sequence, nan=np.nanmean(sequence[~np.isnan(sequence)]))
-            
-            # Handle NaN target by skipping
-            if np.isnan(target):
+            # Convert to float and handle any non-numeric values
+            try:
+                sequence = sequence.astype(float)
+                target = float(target)
+                
+                # Handle NaNs in sequence by filling with column means
+                if pd.isna(sequence).any():
+                    col_means = np.nanmean(sequence, axis=0)
+                    sequence = np.where(pd.isna(sequence), col_means, sequence)
+                
+                # Skip if target is still NaN after conversion
+                if pd.isna(target):
+                    continue
+                    
+            except (ValueError, TypeError):
+                # Skip this sequence if conversion fails
                 continue
                 
             X_seq.append(sequence)

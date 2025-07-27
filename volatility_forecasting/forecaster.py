@@ -65,17 +65,21 @@ class VolatilityForecaster:
             'models': {
                 'AttentionLSTM': {
                     'lstm_units': 128,
-                    'dropout_rate': 0.2,
+                    'attention_units': 64,  # Reduced from default
+                    'dropout_rate': 0.3,   # Slightly higher dropout
+                    'l2_reg': 0.001,      # Add L2 regularization
+                    'use_batch_norm': True,  # Enable batch normalization
                     'learning_rate': {
                         'schedule': 'exponential_decay',
-                        'initial_learning_rate': 0.001,
+                        'initial_learning_rate': 0.0005,  # Reduced from 0.001
                         'decay_steps': 1000,
-                        'decay_rate': 0.96,
+                        'decay_rate': 0.9,  # Slower decay
                         'staircase': True
                     },
                     'batch_size': 32,
                     'epochs': 100,
-                    'patience': 10
+                    'patience': 15,  # Increased patience
+                    'gradient_clip': 1.0  # Add gradient clipping
                 },
                 'CNN_GRU_Attention': {
                     'conv_filters': 64,
@@ -306,9 +310,17 @@ class VolatilityForecaster:
                     # It's a fixed learning rate
                     learning_rate = float(lr_config)
                 
-                # Compile the model with the learning rate (can be float or schedule)
-                model.compile(learning_rate=learning_rate)
+                # Get gradient clipping value from config (default to 1.0 if not specified)
+                gradient_clip = model_config.pop('gradient_clip', 1.0)
                 
+                # Compile the model with learning rate and gradient clipping
+                # Note: gradient_clip is passed to the optimizer in the compile method
+                model.compile(
+                    learning_rate=learning_rate,
+                    gradient_clip=gradient_clip  # This will be used in the model's compile method
+                )
+                
+                # Train the model with validation data
                 history = model.train(
                     X_train, y_train,
                     X_val, y_val,

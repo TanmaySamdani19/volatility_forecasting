@@ -31,7 +31,6 @@ from tensorflow.keras.losses import Huber
 
 # Statistical models for comparison
 from statsmodels.tsa.arima.model import ARIMA
-from arch import arch_model
 import optuna
 
 # Technical indicators
@@ -494,13 +493,3 @@ class BenchmarkModels:
             logger.error(f"Error fitting ARIMA: {e}")
             return None
     
-    def fit_garch(self, returns: np.ndarray, p: int = 1, q: int = 1):
-        """Fit GARCH model"""
-        try:
-            model = arch_model(returns * 100, vol='Garch', p=p, q=q)
-            fitted_model = model.fit(disp='off')
-            self.models['GARCH'] = fitted_model
-            return fitted_model
-        except Exception as e:
-            logger.error(f"Error fitting GARCH: {e}")
-            return None
